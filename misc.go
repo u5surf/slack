@@ -64,28 +64,13 @@ func (e *RateLimitedError) Error() string {
 	return fmt.Sprintf("Slack rate limit exceeded, retry after %s", e.RetryAfter)
 }
 
-func fileUploadReq(ctx context.Context, path, fieldname, filename string, values url.Values, r io.Reader) (*http.Request, error) {
-	body := &bytes.Buffer{}
-	wr := multipart.NewWriter(body)
+func fileUploadReq(ctx context.Context, path string, values url.Values, r io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest("POST", path, r)
 
-	ioWriter, err := wr.CreateFormFile(fieldname, filename)
-	if err != nil {
-		wr.Close()
-		return nil, err
-	}
-	_, err = io.Copy(ioWriter, r)
-	if err != nil {
-		wr.Close()
-		return nil, err
-	}
-	// Close the multipart writer or the footer won't be written
-	wr.Close()
-	req, err := http.NewRequest("POST", path, body)
 	req = req.WithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Add("Content-Type", wr.FormDataContentType())
 	req.URL.RawQuery = (values).Encode()
 	return req, nil
 }
@@ -118,12 +103,34 @@ func postLocalWithMultipartResponse(ctx context.Context, client HTTPRequester, p
 }
 
 func postWithMultipartResponse(ctx context.Context, client HTTPRequester, path, name, fieldname string, values url.Values, r io.Reader, intf interface{}, debug bool) error {
-	req, err := fileUploadReq(ctx, SLACK_API+path, fieldname, name, values, r)
+	pipeReader, pipeWriter := io.Pipe()
+	wr := multipart.NewWriter(pipeWriter)
+	errc := make(chan error)
+	go func() {
+		defer pipeWriter.Close()
+		ioWriter, err := wr.CreateFormFile(fieldname, name)
+		if err != nil {
+			errc <- err
+			return
+		}
+		_, err = io.Copy(ioWriter, r)
+		if err != nil {
+			errc <- err
+			return
+		}
+		if err = wr.Close(); err != nil {
+			errc <- err
+			return
+		}
+	}()
+	req, err := fileUploadReq(ctx, SLACK_API+path, values, pipeReader)
 	if err != nil {
 		return err
 	}
+	req.Header.Add("Content-Type", wr.FormDataContentType())
 	req = req.WithContext(ctx)
 	resp, err := client.Do(req)
+
 	if err != nil {
 		return err
 	}
@@ -142,8 +149,12 @@ func postWithMultipartResponse(ctx context.Context, client HTTPRequester, path, 
 		logResponse(resp, debug)
 		return statusCodeError{Code: resp.StatusCode, Status: resp.Status}
 	}
-
-	return parseResponseBody(resp.Body, intf, debug)
+	select {
+	case err = <-errc:
+		return err
+	default:
+		return parseResponseBody(resp.Body, intf, debug)
+	}
 }
 
 func doPost(ctx context.Context, client HTTPRequester, req *http.Request, intf interface{}, debug bool) error {
